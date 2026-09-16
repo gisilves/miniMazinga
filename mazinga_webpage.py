@@ -1,17 +1,24 @@
-"""FTA SCD Microstrip Raw Data Reader - Multi-channel live HTML dashboard.
+"""miniMazinga - Multi-channel live HTML dashboard.
 
-Reads ONE quadder from the UDP event stream, and tracks a configurable list
-of 8 individual channels within it, each with its own threshold.
+Reads DE10Nano data from the UDP event stream.
+
+To simulate miniMazinga readout we read for the moment silicon microstrip data, 
+tracking a configurable list of 8 individual channels, each with its own threshold
+to simulate the LED behavior. The channels are displayed in a 2x4 grid.
+
 Serves a local web page showing:
-  - each channel's latest value as a virtual LED, lit when above threshold
+  - each as a virtual LED, lit when above threshold
     (top 2x4 grid)
+    
   - each channel's accumulated sum, only incremented on events above
     threshold (bottom 2x4 grid)
-plus Start/Stop/Reset accumulation controls, Export to file button, and an elapsed-time timer.
-Polled over HTTP - no PyQt / matplotlib needed.
+    
+  - accumulated coincidences (top & bottom 2x4 grid)
+  
+  - Start/Stop/Reset accumulation controls, Export to file button, and an elapsed-time timer.
 
 Usage:
-    python scd_multi_channel_viewer.py \
+    python mazinga_webpage.py \
         --quadder 0 \
         --channels 10,42,100,200,300,500,900,1500 \
         --thresholds 500,500,500,500,500,500,500,500
@@ -207,7 +214,7 @@ def export_to_file(channels, quadder_index):
 
         lines = [
             "========================================",
-            "  SCD Viewer - Exported Run Statistics ",
+            "  miniMazinga - Exported Run Statistics ",
             "========================================",
             f"Timestamp:      {timestamp}",
             f"Quadder Index:  {quadder_index}",
@@ -297,7 +304,7 @@ def build_html(channels, quadder_index):
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>SCD Multi-Channel Viewer</title>
+<title>miniMazinga Viewer</title>
 <style>
   body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -434,9 +441,9 @@ def build_html(channels, quadder_index):
 </style>
 </head>
 <body>
-<h1>SCD Multi-Channel Viewer &mdash; Quadder {quadder_index}</h1>
+<h1>miniMazinga Viewer</h1>
 
-<h2>Above threshold (LED)</h2>
+<h2>Status LEDs</h2>
 <div class="grid">
 {led_cells}
 </div>
@@ -455,7 +462,7 @@ def build_html(channels, quadder_index):
   <span class="timer" id="timer">00:00.0</span>
 </div>
 
-<h2>Accumulated sum, above-threshold events only (<span id="countLabel">0</span> events)</h2>
+<h2>Accumulated sum (<span id="countLabel">0</span> events)</h2>
 <div class="grid">
 {sum_cells}
 </div>
