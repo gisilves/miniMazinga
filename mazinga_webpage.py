@@ -2,10 +2,6 @@
 
 Reads DE10Nano data from the UDP event stream.
 
-To simulate miniMazinga readout we read for the moment silicon microstrip data, 
-tracking a configurable list of 8 individual channels, each with its own threshold
-to simulate the LED behavior. The channels are displayed in a 2x4 grid.
-
 Serves local web pages showing:
 
   Status page:
@@ -24,9 +20,6 @@ Serves local web pages showing:
 
 Usage:
     python mazinga_webpage.py \
-        --quadder 0 \
-        --channels 10,42,100,200,300,500,900,1500 \
-        --thresholds 500,500,500,500,500,500,500,500
 
 Then open http://127.0.0.1:8000/ in a browser.
 """
@@ -45,8 +38,8 @@ UDP_PORT = 8890
 BUF_SIZE = 65535
 
 EVENT_START = 0xfa4af1ca
-QUADDER_START = 0xbaba1a9a
-QUADDER_END = 0x0bedface
+de10nano_START = 0xbaba1a9a
+de10nano_END = 0x0bedface
 
 N_CHANNELS = 1792
 
@@ -65,41 +58,18 @@ accum_start_time = None  # epoch time of current run start/resume, or None
 accum_elapsed = 0.0      # accumulated elapsed seconds from completed runs
 event_id_counter = 0
 
-thresholds = {}          # {channel_index: threshold value}, set by main()
 top_channels_global = []   # set by main()
 bottom_channels_global = []  # set by main()
 
 
-# --------------------------------------------------------------------------------
-# Decode of QUADDER raw data, used to emulate miniMazinga data during development
-# --------------------------------------------------------------------------------
-def reorder(v):
-    """Reorder ADC channels from multiplexer in the correct sequence."""
-    reordered = [0] * len(v)
-    j = 0
-    order = [12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1]
-
-    for ch in range(128):
-        for adc in order:
-            reordered[adc * 128 + ch] = v[j]
-            j += 1
-
-    return reordered
-
-
-def decode_quadder(words):
-    """Decode the raw data from the quadder."""
-    channels = []
-    for w in words:
-        ch_low = (w & 0xFFFF)
-        ch_high = ((w >> 16) & 0xFFFF)
-        channels.append(ch_low)
-        channels.append(ch_high)
+def decode_payload(word):
+    """Decode the raw data from the de10nano."""
+    channels = [(word >> i) & 1 for i in range(8)]
     return channels
 
 
-def udp_loop(quadder_index, channels, ip, port, stop_event):
-    """Parse the UDP event stream for one quadder, tracking `channels`."""
+def udp_loop(de10nano_index, channels, ip, port, stop_event):
+    """Parse the UDP event stream for one de10nano, tracking `channels`."""
     global event_id_counter, accum_count
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -107,12 +77,12 @@ def udp_loop(quadder_index, channels, ip, port, stop_event):
     sock.settimeout(0.2)
 
     in_event = False
-    in_quadder = False
+    in_de10nano = False
     words_read = 0
-    quadder_read = 0
-    quadder_words = []
+    de10nano_read = 0
+    de10nano_words = []
 
-    print(f"Listening on {ip}:{port} for quadder {quadder_index}, channels {channels}...")
+    print(f"Listening on {ip}:{port} for de10nano {de10nano_index}, channels {channels}...")
 
     try:
         while not stop_event.is_set():
@@ -128,23 +98,23 @@ def udp_loop(quadder_index, channels, ip, port, stop_event):
 
                 if w == EVENT_START:
                     in_event = True
-                    in_quadder = False
-                    quadder_read = 0
-                    quadder_words.clear()
+                    in_de10nano = False
+                    de10nano_read = 0
+                    de10nano_words.clear()
                     continue
 
                 if not in_event:
                     continue
 
-                if w == QUADDER_START:
-                    quadder_read += 1
-                    if quadder_read == quadder_index + 1:
-                        in_quadder = True
-                        quadder_words.clear()
+                if w == de10nano_START:
+                    de10nano_read += 1
+                    if de10nano_read == de10nano_index + 1:
+                        in_de10nano = True
+                        de10nano_words.clear()
                         continue
 
-                if w == QUADDER_END and in_quadder and quadder_read == quadder_index + 1:
-                    raw_channels = reorder(decode_quadder(quadder_words[8:]))
+                if w == de10nano_END and in_de10nano and de10nano_read == de10nano_index + 1:
+                    raw_channels = decode_payload(de10nano_words[10])
                     ch = raw_channels[:N_CHANNELS]
 
                     with state_lock:
@@ -153,7 +123,7 @@ def udp_loop(quadder_index, channels, ip, port, stop_event):
                         for c in channels:
                             value = ch[c] if c < len(ch) else None
                             latest_values[c] = value
-                            is_above = value is not None and value > thresholds[c]
+                            is_above = bool(value)
                             above_threshold[c] = is_above
 
                             if accumulating and is_above:
@@ -168,12 +138,12 @@ def udp_loop(quadder_index, channels, ip, port, stop_event):
                                         key = (t, b)
                                         coinc_count[key] = coinc_count.get(key, 0) + 1
 
-                    in_quadder = False
-                    quadder_words.clear()
+                    in_de10nano = False
+                    de10nano_words.clear()
                     continue
 
-                if in_quadder and quadder_read == quadder_index + 1:
-                    quadder_words.append(w)
+                if in_de10nano and de10nano_read == de10nano_index + 1:
+                    de10nano_words.append(w)
 
     finally:
         sock.close()
@@ -213,7 +183,7 @@ def reset_accumulation(channels):
         }
 
 
-def export_to_file(channels, quadder_index):
+def export_to_file(channels, de10nano_index):
     with state_lock:
         elapsed_sec = current_elapsed()
         m = int(elapsed_sec // 60)
@@ -226,14 +196,14 @@ def export_to_file(channels, quadder_index):
             "  miniMazinga - Exported Run Statistics ",
             "========================================",
             f"Timestamp:      {timestamp}",
-            f"Quadder Index:  {quadder_index}",
+            f"de10nano Index:  {de10nano_index}",
             f"Elapsed Time:   {elapsed_str} ({elapsed_sec:.2f} s)",
             f"Total Events:   {accum_count}",
             "----------------------------------------",
             "Accumulated Sums (Above Threshold):",
         ]
         for c in channels:
-            lines.append(f"  Channel {c:4d}: {accum_sum.get(c, 0)} (Threshold: {thresholds.get(c, 0)})")
+            lines.append(f"  Channel {c:4d}: {accum_sum.get(c, 0)}")
 
         lines.append("----------------------------------------")
         lines.append("Accumulated Coincidences (Top & Bottom):")
@@ -243,7 +213,7 @@ def export_to_file(channels, quadder_index):
                 lines.append(f"  T{t} & B{b}: {count}")
         lines.append("========================================\n")
 
-    filename = f"scd_export_quadder{quadder_index}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    filename = f"export_de10nano{de10nano_index}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(filename, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"Exported run statistics to {filename}")
@@ -269,7 +239,6 @@ def build_leds_html(channels):
         <div class="cell" id="cell-{c}">
           <h3>{name} {c}</h3>
           <div class="led" id="led-{c}"></div>
-          <div class="thresh">thr &gt; {thresholds[c]}</div>
         </div>'''
             for c in chs
         )
@@ -482,7 +451,7 @@ poll();
 """
 
 
-def build_html(channels, quadder_index):
+def build_html(channels, de10nano_index):
     """4x4 coincidence grid, 2x4 sums. Status LEDs live on /leds."""
     top_channels = channels[0:4]
     bottom_channels = channels[4:8]
@@ -822,14 +791,14 @@ poll();
 
 class Handler(BaseHTTPRequestHandler):
     channels = []        # set by main()
-    quadder_index = 0    # set by main()
+    de10nano_index = 0    # set by main()
 
     def log_message(self, fmt, *args):
         pass  # keep the console quiet
 
     def do_GET(self):
             if self.path in ("/", "/index.html"):
-                body = build_html(self.channels, self.quadder_index).encode("utf-8")
+                body = build_html(self.channels, self.de10nano_index).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -901,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
             reset_accumulation(self.channels)
             self._ok()
         elif self.path == "/export":
-            filename = export_to_file(self.channels, self.quadder_index)
+            filename = export_to_file(self.channels, self.de10nano_index)
             body = json.dumps({"ok": True, "filename": filename}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -922,17 +891,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global accum_sum, thresholds, top_channels_global, bottom_channels_global, coinc_count
+    global accum_sum, top_channels_global, bottom_channels_global, coinc_count
 
     parser = argparse.ArgumentParser(
         description="Live dashboard: LEDs above threshold + accumulated sum, for 8 channels."
     )
-    parser.add_argument("--quadder", type=int, default=0, help="Quadder index to read (0-7)")
+    parser.add_argument("--de10nano", type=int, default=0, help="de10nano index to read (0-7)")
     parser.add_argument("--channels", type=str, default="0,1,2,3,4,5,6,7",
                         help="Comma-separated list of 8 channel indices (0-1791), in display order.")
-    parser.add_argument("--thresholds", type=str, default="1546,1604,1643,1686,1687,1643,1628,1643",
-                        help="Comma-separated list of 8 thresholds (one per channel, same order as --channels). "
-                             "A channel lights up and is accumulated when its value is strictly above its threshold.")
     parser.add_argument("--ip", type=str, default=UDP_IP, help="UDP bind IP")
     parser.add_argument("--port", type=int, default=UDP_PORT, help="UDP bind port")
     parser.add_argument("--http-port", type=int, default=8000, help="Local web server port")
@@ -942,11 +908,6 @@ def main():
     if len(channels) != 8:
         raise SystemExit(f"Expected exactly 8 channels, got {len(channels)}: {channels}")
 
-    thresh_values = [int(x.strip()) for x in args.thresholds.split(",")]
-    if len(thresh_values) != 8:
-        raise SystemExit(f"Expected exactly 8 thresholds, got {len(thresh_values)}: {thresh_values}")
-
-    thresholds = dict(zip(channels, thresh_values))
     accum_sum = {c: 0 for c in channels}
     top_channels_global = channels[0:4]
     bottom_channels_global = channels[4:8]
@@ -955,11 +916,11 @@ def main():
     }
 
     Handler.channels = channels
-    Handler.quadder_index = args.quadder
+    Handler.de10nano_index = args.de10nano
 
     stop_event = threading.Event()
     udp_thread = threading.Thread(
-        target=udp_loop, args=(args.quadder, channels, args.ip, args.port, stop_event), daemon=True
+        target=udp_loop, args=(args.de10nano, channels, args.ip, args.port, stop_event), daemon=True
     )
     udp_thread.start()
 
