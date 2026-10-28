@@ -7,10 +7,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-f", "--file", help="File to send", required=True)
 parser.add_argument("-i", "--ip", help="IP address to send to", default="127.0.0.1")
 parser.add_argument("-p", "--port", help="Port to send to", default=8890)
-parser.add_argument("-d", "--delay", help="Delay between each word", required=False, default=1)
+parser.add_argument("-d", "--delay", help="Delay between each word", required=False, default=0.0)
 args = parser.parse_args()
 
-def send_words_udp(file_path, ip, port, delay=1):
+def send_words_udp(file_path, ip, port, delay=0.1):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
     try:
@@ -38,4 +38,5 @@ if __name__ == "__main__":
     TARGET_PORT = 8890
     
     # Send the file
-    send_words_udp(args.file, args.ip, int(args.port), int(args.delay))
+    while(1):
+        send_words_udp(args.file, args.ip, int(args.port), float(args.delay))
