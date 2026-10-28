@@ -6,16 +6,21 @@ To simulate miniMazinga readout we read for the moment silicon microstrip data,
 tracking a configurable list of 8 individual channels, each with its own threshold
 to simulate the LED behavior. The channels are displayed in a 2x4 grid.
 
-Serves a local web page showing:
-  - each as a virtual LED, lit when above threshold
-    (top 2x4 grid)
+Serves local web pages showing:
+
+  Status page:
+    - each as a virtual LED, lit when above threshold
+      (top 2x4 grid)
+
+    - arrows between top and bottom LED rows, lit when a coincidence is fired
     
-  - each channel's accumulated sum, only incremented on events above
-    threshold (bottom 2x4 grid)
+  Data page:
+    - each channel's accumulated sum, only incremented on events above
+      threshold (bottom 2x4 grid)
+      
+    - accumulated coincidences (top & bottom 2x4 grid)
     
-  - accumulated coincidences (top & bottom 2x4 grid)
-  
-  - Start/Stop/Reset accumulation controls, Export to file button, and an elapsed-time timer.
+    - Start/Stop/Reset accumulation controls, Export to file button, and an elapsed-time timer.
 
 Usage:
     python mazinga_webpage.py \
@@ -31,6 +36,7 @@ import json
 import socket
 import threading
 import time
+import math
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -64,6 +70,9 @@ top_channels_global = []   # set by main()
 bottom_channels_global = []  # set by main()
 
 
+# --------------------------------------------------------------------------------
+# Decode of QUADDER raw data, used to emulate miniMazinga data during development
+# --------------------------------------------------------------------------------
 def reorder(v):
     """Reorder ADC channels from multiplexer in the correct sequence."""
     reordered = [0] * len(v)
@@ -252,20 +261,231 @@ def current_elapsed():
 # HTTP server
 # ----------------------------------------------------------------------
 
-def build_html(channels, quadder_index):
-    """Top 2x4 grid of LEDs (threshold), 4x4 coincidence grid, bottom 2x4 sums."""
-    top_channels = channels[0:4]
-    bottom_channels = channels[4:8]
-
-    led_cells = "\n".join(
-        f'''
-        <div class="cell">
-          <h3>Channel {c}</h3>
+def build_leds_html(channels):
+    """Separate page: 2x4 grid of status LEDs (lit when above threshold)."""
+    def make_cells(chs, name):
+        return "\n".join(
+            f'''
+        <div class="cell" id="cell-{c}">
+          <h3>{name} {c}</h3>
           <div class="led" id="led-{c}"></div>
           <div class="thresh">thr &gt; {thresholds[c]}</div>
         </div>'''
-        for c in channels
-    )
+            for c in chs
+        )
+
+    top_cells = make_cells(channels[0:4], "Top")
+    bottom_cells = make_cells(channels[4:8], "Bottom")
+    channel_list_js = json.dumps(channels)
+    top_channels_js = json.dumps(channels[0:4])
+    bottom_channels_js = json.dumps(channels[4:8])
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>miniMazinga Status LEDs</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background-color: #0f172a;
+    background-image: url('background.jpg');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    color: #f8fafc;
+    margin: 0;
+    padding: 12px;
+  }}
+  h1 {{
+    font-size: 16px;
+    margin: 0 0 4px 4px;
+    color: #f1f5f9;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  }}
+  a {{ color: #38bdf8; font-size: 12px; margin-left: 4px; }}
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    grid-template-rows: 1fr;
+    gap: 6px;
+    max-width: 800px;
+  }}
+  .wrap {{
+    position: relative;
+    max-width: 800px;
+    margin-top: 8px;
+  }}
+  .spacer {{
+    height: 500px;
+  }}
+  .arrows {{
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+  }}
+  .arrows line {{
+    stroke: #475569;
+    stroke-width: 2.5;
+    opacity: 0.6;
+  }}
+  .arrows line.on {{
+    stroke: #ef4444;
+    stroke-width: 2.5;
+    opacity: 1;
+    filter: drop-shadow(0 0 4px rgba(239, 68, 68, 0.9));
+  }}
+  .cell {{
+    background: rgba(30, 41, 59, 0.85);
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    padding: 6px;
+    min-width: 0;
+    text-align: center;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+  }}
+  .cell h3 {{
+    margin: 0 0 2px 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+  }}
+  .led {{
+    width: 24px;
+    height: 24px;
+    margin: 2px auto;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #450a0a, #180202);
+    border: 1.5px solid #0f172a;
+    box-shadow: inset 0 0 4px rgba(0,0,0,0.8);
+    transition: background 0.08s linear, box-shadow 0.08s linear;
+  }}
+  .led.on {{
+    background: radial-gradient(circle at 35% 30%, #fca5a5, #ef4444);
+    border-color: #991b1b;
+    box-shadow: 0 0 10px 2px rgba(239, 68, 68, 0.9), inset 0 0 4px rgba(255,255,255,0.4);
+  }}
+  .thresh {{
+    font-size: 9px;
+    color: #94a3b8;
+  }}
+</style>
+</head>
+<body>
+<h1>miniMazinga Status LEDs</h1>
+<a href="/">&larr; Back to main dashboard</a>
+<div class="wrap" id="wrap">
+  <div class="grid">
+{top_cells}
+  </div>
+  <div class="spacer"></div>
+  <div class="grid">
+{bottom_cells}
+  </div>
+  <svg class="arrows" id="arrows" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="head-off" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+      </marker>
+      <marker id="head-on" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#ef4444"/>
+      </marker>
+    </defs>
+  </svg>
+</div>
+
+<script>
+const channels = {channel_list_js};
+const topChannels = {top_channels_js};
+const bottomChannels = {bottom_channels_js};
+const SVGNS = 'http://www.w3.org/2000/svg';
+const arrowLines = {{}};  // key "t-b" -> <line>
+
+function drawArrows() {{
+  const wrap = document.getElementById('wrap').getBoundingClientRect();
+  const svg = document.getElementById('arrows');
+  svg.querySelectorAll('line').forEach(l => l.remove());
+  const SPREAD = 10;  // px between arrow endpoints on one cell edge
+  topChannels.forEach((t, i) => {{
+    const tr = document.getElementById('cell-' + t).getBoundingClientRect();
+    bottomChannels.forEach((b, j) => {{
+      const br = document.getElementById('cell-' + b).getBoundingClientRect();
+      const x1 = tr.left + tr.width / 2 + (j - 1.5) * SPREAD - wrap.left;
+      const y1 = tr.bottom - wrap.top;
+      const x2 = br.left + br.width / 2 + (i - 1.5) * SPREAD - wrap.left;
+      const y2 = br.top - wrap.top - 2;
+      const line = document.createElementNS(SVGNS, 'line');
+      line.setAttribute('x1', x1);
+      line.setAttribute('y1', y1);
+      line.setAttribute('x2', x2);
+      line.setAttribute('y2', y2);
+      line.setAttribute('marker-end', 'url(#head-off)');
+      svg.appendChild(line);
+      arrowLines[t + '-' + b] = line;
+    }});
+  }});
+}}
+
+function setArrow(line, on) {{
+  if (on) {{
+    if (!line.classList.contains('on')) {{
+      line.classList.add('on');
+      line.setAttribute('marker-end', 'url(#head-on)');
+      line.parentNode.appendChild(line);  // bring lit arrow to front
+    }}
+  }} else if (line.classList.contains('on')) {{
+    line.classList.remove('on');
+    line.setAttribute('marker-end', 'url(#head-off)');
+  }}
+}}
+
+drawArrows();
+window.addEventListener('resize', drawArrows);
+
+async function poll() {{
+  try {{
+    const res = await fetch('/data.json');
+    const data = await res.json();
+    for (const c of channels) {{
+      const entry = data.channels[c];
+      const ledEl = document.getElementById('led-' + c);
+      if (entry && entry.above) {{
+        ledEl.classList.add('on');
+      }} else {{
+        ledEl.classList.remove('on');
+      }}
+    }}
+    for (const t of topChannels) {{
+      for (const b of bottomChannels) {{
+        const topOn = data.channels[t] && data.channels[t].above;
+        const bottomOn = data.channels[b] && data.channels[b].above;
+        setArrow(arrowLines[t + '-' + b], !!(topOn && bottomOn));
+      }}
+    }}
+  }} catch (e) {{
+    console.error(e);
+  }}
+  setTimeout(poll, 200);
+}}
+poll();
+</script>
+</body>
+</html>
+"""
+
+
+def build_html(channels, quadder_index):
+    """4x4 coincidence grid, 2x4 sums. Status LEDs live on /leds."""
+    top_channels = channels[0:4]
+    bottom_channels = channels[4:8]
 
     coinc_cells = "\n".join(
         f'''
@@ -277,23 +497,43 @@ def build_html(channels, quadder_index):
         for b in bottom_channels
     )
 
+    distance_between_rows = 15
+    bar_width = 4
+    # Compute the angle corresponding to the bars coincidences
+    coinc_angles = {}
+
+    for i, t in enumerate(top_channels):
+        for j, b in enumerate(bottom_channels):
+            dx = (i - j) * bar_width
+            coinc_angles[(t, b)] = math.degrees(math.atan2(dx, distance_between_rows))
+
     coinc_sum_cells = "\n".join(
         f'''
         <div class="cell coinc-cell">
           <h3>T{t} &amp; B{b}</h3>
           <div class="value sum" id="coincsum-{t}-{b}">&mdash;</div>
+          <div class="angle">{coinc_angles[(t, b)]:.1f}&deg;</div>
         </div>'''
         for t in top_channels
         for b in bottom_channels
     )
 
-    sum_cells = "\n".join(
+    sum_cells_top = "\n".join(
         f'''
         <div class="cell">
-          <h3>Channel {c}</h3>
-          <div class="value sum" id="sum-{c}">&mdash;</div>
+          <h3>Top {t}</h3>
+          <div class="value sum" id="sum-{t}">&mdash;</div>
         </div>'''
-        for c in channels
+        for t in top_channels
+    )
+
+    sum_cells_bottom = "\n".join(
+        f'''
+        <div class="cell">
+          <h3>Bottom {b}</h3>
+          <div class="value sum" id="sum-{b}">&mdash;</div>
+        </div>'''
+        for b in bottom_channels
     )
 
     channel_list_js = json.dumps(channels)
@@ -308,145 +548,175 @@ def build_html(channels, quadder_index):
 <style>
   body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #f6f7f8;
-    color: #1f2933;
+    background-color: #0f172a;
+    background-image: url('background.jpg');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    color: #f8fafc;
     margin: 0;
-    padding: 16px;
+    padding: 12px;
   }}
   h1 {{
-    font-size: 18px;
+    font-size: 16px;
     margin: 0 0 4px 4px;
+    color: #f1f5f9;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
   }}
   h2 {{
-    font-size: 14px;
-    margin: 20px 0 8px 4px;
-    color: #374151;
+    font-size: 12px;
+    margin: 12px 0 6px 4px;
+    color: #cbd5e1;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
   }}
   .grid {{
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     grid-template-rows: repeat(2, 1fr);
-    gap: 12px;
+    gap: 6px;
+    max-width: 800px;
   }}
   .grid.coinc {{
     grid-template-rows: repeat(4, 1fr);
   }}
-  .coinc-cell {{
-    padding: 10px;
-  }}
-  .coinc-cell h3 {{
-    font-size: 11px;
-    margin-bottom: 6px;
-  }}
-  .led.led-small {{
-    width: 30px;
-    height: 30px;
-    margin: 2px auto 4px auto;
-  }}
   .cell {{
-    background: white;
-    border: 1px solid #d1d5db;
-    border-radius: 8px;
-    padding: 16px;
+    background: rgba(30, 41, 59, 0.85);
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    padding: 6px;
     min-width: 0;
     text-align: center;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+  }}
+  .coinc-cell {{
+    padding: 4px;
   }}
   .cell h3 {{
-    margin: 0 0 8px 0;
-    font-size: 13px;
+    margin: 0 0 2px 0;
+    font-size: 11px;
     font-weight: 600;
-    color: #6b7280;
+    color: #94a3b8;
+  }}
+  .coinc-cell h3 {{
+    font-size: 10px;
+    margin-bottom: 2px;
   }}
   .value {{
-    font-size: 36px;
+    font-size: 20px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
-    color: #2563eb;
+    color: #38bdf8;
   }}
   .value.sum {{
-    color: #059669;
+    color: #34d399;
   }}
   .led {{
-    width: 48px;
-    height: 48px;
-    margin: 4px auto 6px auto;
+    width: 24px;
+    height: 24px;
+    margin: 2px auto;
     border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #4b1113, #2a0a0b);
-    border: 2px solid #1f0607;
-    box-shadow: inset 0 0 6px rgba(0,0,0,0.6);
+    background: radial-gradient(circle at 35% 30%, #450a0a, #180202);
+    border: 1.5px solid #0f172a;
+    box-shadow: inset 0 0 4px rgba(0,0,0,0.8);
     transition: background 0.08s linear, box-shadow 0.08s linear;
   }}
+  .led.led-small {{
+    width: 16px;
+    height: 16px;
+    margin: 2px auto;
+  }}
   .led.on {{
-    background: radial-gradient(circle at 35% 30%, #ff6b6b, #d61f26);
-    border-color: #7a0f12;
-    box-shadow: 0 0 14px 4px rgba(255,40,40,0.85), inset 0 0 6px rgba(255,255,255,0.3);
+    background: radial-gradient(circle at 35% 30%, #fca5a5, #ef4444);
+    border-color: #991b1b;
+    box-shadow: 0 0 10px 2px rgba(239, 68, 68, 0.9), inset 0 0 4px rgba(255,255,255,0.4);
   }}
   .thresh {{
-    font-size: 11px;
-    color: #9ca3af;
+    font-size: 9px;
+    color: #94a3b8;
   }}
   .controls {{
     display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 16px;
-    margin: 16px auto;
+    justify-content: flex-start;
+    gap: 10px;
+    margin: 12px 0;
     flex-wrap: wrap;
+    background: rgba(15, 23, 42, 0.75);
+    backdrop-filter: blur(4px);
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    max-width: 800px;
   }}
   button {{
-    font-size: 13px;
+    font-size: 11px;
     font-weight: 600;
-    padding: 8px 16px;
-    border-radius: 6px;
-    border: 1px solid #cbd5e1;
-    background: #e5e7eb;
+    padding: 6px 12px;
+    border-radius: 4px;
+    border: 1px solid #475569;
+    background: #334155;
+    color: #f8fafc;
     cursor: pointer;
   }}
   button:hover {{
-    background: #dbeafe;
+    background: #475569;
   }}
   #startBtn {{
+    background: #15803d;
+    color: #ffffff;
+    border-color: #166534;
+  }}
+  #startBtn:hover {{
     background: #16a34a;
-    color: white;
-    border-color: #15803d;
   }}
   #stopBtn {{
+    background: #b91c1c;
+    color: #ffffff;
+    border-color: #991b1b;
+  }}
+  #stopBtn:hover {{
     background: #dc2626;
-    color: white;
-    border-color: #b91c1c;
   }}
   #resetBtn {{
-    background: #6b7280;
-    color: white;
-    border-color: #4b5563;
+    background: #475569;
+    color: #ffffff;
+    border-color: #334155;
+  }}
+  #resetBtn:hover {{
+    background: #64748b;
   }}
   #exportBtn {{
+    background: #1d4ed8;
+    color: #ffffff;
+    border-color: #1e40af;
+  }}
+  #exportBtn:hover {{
     background: #2563eb;
-    color: white;
-    border-color: #1d4ed8;
   }}
   .status {{
-    font-size: 13px;
-    color: #6b7280;
-    margin-left: 8px;
+    font-size: 11px;
+    color: #cbd5e1;
+    margin-left: 4px;
   }}
   .timer {{
-    font-size: 20px;
+    font-size: 16px;
     font-weight: 700;
     font-variant-numeric: tabular-nums;
+    color: #cbd5e1;
   }}
   .running {{
-    color: #16a34a;
+    color: #4ade80;
   }}
 </style>
 </head>
 <body>
 <h1>miniMazinga Viewer</h1>
 
-<h2>Status LEDs</h2>
-<div class="grid">
-{led_cells}
-</div>
+<a href="/leds" target="_blank" style="color:#38bdf8;font-size:12px;margin-left:4px;">Open Status LEDs page &rarr;</a>
 
 <h2>Coincidence: top (T) AND bottom (B)</h2>
 <div class="grid coinc">
@@ -464,7 +734,8 @@ def build_html(channels, quadder_index):
 
 <h2>Accumulated sum (<span id="countLabel">0</span> events)</h2>
 <div class="grid">
-{sum_cells}
+{sum_cells_top}
+{sum_cells_bottom}
 </div>
 
 <h2>Accumulated coincidences (T &amp; B)</h2>
@@ -502,14 +773,7 @@ async function poll() {{
 
     for (const c of channels) {{
       const entry = data.channels[c];
-      const ledEl = document.getElementById('led-' + c);
       const sumEl = document.getElementById('sum-' + c);
-
-      if (entry && entry.above) {{
-        ledEl.classList.add('on');
-      }} else {{
-        ledEl.classList.remove('on');
-      }}
 
       sumEl.textContent = (entry && entry.sum !== null && entry.sum !== undefined)
         ? entry.sum : '\\u2014';
@@ -556,7 +820,6 @@ poll();
 </html>
 """
 
-
 class Handler(BaseHTTPRequestHandler):
     channels = []        # set by main()
     quadder_index = 0    # set by main()
@@ -565,46 +828,67 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep the console quiet
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            body = build_html(self.channels, self.quadder_index).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            if self.path in ("/", "/index.html"):
+                body = build_html(self.channels, self.quadder_index).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
-        elif self.path == "/data.json":
-            with state_lock:
-                channels_data = {
-                    str(c): {
-                        "value": latest_values.get(c),
-                        "above": above_threshold.get(c, False),
-                        "sum": accum_sum.get(c),
+            elif self.path == "/leds":
+                body = build_leds_html(self.channels).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            elif self.path == "/background.jpg":
+                try:
+                    with open("background.jpg", "rb") as f:
+                        content = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content)
+                except FileNotFoundError:
+                    self.send_response(404)
+                    self.end_headers()
+
+            elif self.path == "/data.json":
+                with state_lock:
+                    channels_data = {
+                        str(c): {
+                            "value": latest_values.get(c),
+                            "above": above_threshold.get(c, False),
+                            "sum": accum_sum.get(c),
+                        }
+                        for c in self.channels
                     }
-                    for c in self.channels
-                }
-                coinc = {
-                    f"{t}-{b}": coinc_count.get((t, b), 0)
-                    for t in top_channels_global
-                    for b in bottom_channels_global
-                }
-                payload = {
-                    "channels": channels_data,
-                    "coinc_count": coinc,
-                    "accumulating": accumulating,
-                    "accum_count": accum_count,
-                    "elapsed": current_elapsed(),
-                }
-            body = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+                    coinc = {
+                        f"{t}-{b}": coinc_count.get((t, b), 0)
+                        for t in top_channels_global
+                        for b in bottom_channels_global
+                    }
+                    payload = {
+                        "channels": channels_data,
+                        "coinc_count": coinc,
+                        "accumulating": accumulating,
+                        "accum_count": accum_count,
+                        "elapsed": current_elapsed(),
+                    }
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
-        else:
-            self.send_response(404)
-            self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
 
     def do_POST(self):
         if self.path == "/start":
