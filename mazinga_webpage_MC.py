@@ -1,0 +1,932 @@
+"""miniMazinga - Multi-channel live HTML dashboard (CSV replay version).
+
+Reads a CSV file where each line is one event, encoded as a 10-bit mask,
+e.g. 1000010000
+  - first 5 bits  -> top channels    (T0..T4)
+  - last  5 bits  -> bottom channels (B0..B4)
+A bit set to 1 means the channel is above threshold in that event.
+
+Serves local web pages showing:
+
+  Status page (/leds):
+    - each channel as a virtual LED, lit when its bit is 1
+    - arrows between top and bottom LED rows, lit when a coincidence is fired
+
+  Data page (/):
+    - each channel's accumulated sum (only incremented on bit == 1)
+    - accumulated coincidences (top & bottom 5x5 grid)
+    - Start/Stop/Reset accumulation controls, Export to file button,
+      and an elapsed-time timer.
+
+Usage:
+    python mazinga_webpage.py masks.csv [--rate 10] [--loop]
+
+Events arrive as a Poisson process: --rate is the mean rate, and the waiting
+time between events is exponentially distributed.
+
+Then open http://127.0.0.1:8000/ in a browser.
+
+CSV notes: one mask per line. Separators (commas/spaces) inside a line are
+ignored, so "1,0,0,0,0,1,0,0,0,0" also works. If a line has more than one
+comma-separated field and the first one is a valid 10-bit mask, the first
+field is used. Empty lines and lines that are not valid masks (e.g. a
+header) are skipped.
+"""
+
+import argparse
+import json
+import threading
+import time
+import math
+import random
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+N_TOP = 5
+N_BOTTOM = 5
+N_CHANNELS = N_TOP + N_BOTTOM
+
+# ----------------------------------------------------------------------
+# Shared state, guarded by a lock (written by the replay thread, read/reset
+# by the HTTP server thread).
+# ----------------------------------------------------------------------
+state_lock = threading.Lock()
+latest_values = {}      # {channel_index: 0/1}
+above_threshold = {}    # {channel_index: bool}
+accum_sum = {}          # {channel_index: running sum}
+accum_count = 0         # number of events folded into accum_sum (any channel)
+coinc_count = {}        # {(top_channel, bottom_channel): count of coincident events}
+accumulating = False    # whether new events are being added to accum_sum
+accum_start_time = None  # epoch time of current run start/resume, or None
+accum_elapsed = 0.0     # accumulated elapsed seconds from completed runs
+event_id_counter = 0
+replay_finished = False
+
+top_channels_global = []     # set by main()
+bottom_channels_global = []  # set by main()
+
+
+def parse_mask(line):
+    """Parse one CSV line into a list of N_CHANNELS ints, or None if invalid."""
+    line = line.strip()
+    if not line:
+        return None
+
+    candidates = []
+    # Whole line with separators removed (handles "1,0,0,..." and "1000010000")
+    candidates.append("".join(ch for ch in line if ch not in ", \t;"))
+    # First comma-separated field (handles "1000010000,other,columns")
+    candidates.append(line.split(",")[0].strip())
+
+    for cand in candidates:
+        if len(cand) == N_CHANNELS and set(cand) <= {"0", "1"}:
+            return [int(ch) for ch in cand]
+    return None
+
+
+def replay_loop(csv_path, channels, rate_hz, loop, stop_event):
+    """Read masks from the CSV and feed them in as events.
+
+    `rate_hz` is the mean event rate: inter-arrival times are drawn from an
+    exponential distribution (i.e. Poisson arrivals). rate_hz <= 0 plays as
+    fast as possible.
+    """
+    global event_id_counter, accum_count, replay_finished
+
+    #print(f"Replaying {csv_path} at mean {rate_hz} events/s, Poisson arrivals (loop={loop})...")
+
+    while not stop_event.is_set():
+        n_events = 0
+        with open(csv_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if stop_event.is_set():
+                    break
+                bits = parse_mask(line)
+                if bits is None:
+                    continue
+                n_events += 1
+
+                with state_lock:
+                    event_id_counter += 1
+                    touched = False
+                    for c in channels:
+                        value = bits[c]
+                        latest_values[c] = value
+                        is_above = bool(value)
+                        above_threshold[c] = is_above
+                        if accumulating and is_above:
+                            accum_sum[c] += 1
+                            touched = True
+                    if accumulating and touched:
+                        accum_count += 1
+                    if accumulating:
+                        for t in top_channels_global:
+                            for b in bottom_channels_global:
+                                if above_threshold.get(t) and above_threshold.get(b):
+                                    key = (t, b)
+                                    coinc_count[key] = coinc_count.get(key, 0) + 1
+
+                if rate_hz > 0:
+                    stop_event.wait(random.expovariate(rate_hz))
+
+        if n_events == 0:
+            print(f"No valid masks found in {csv_path}.")
+            break
+        if not loop:
+            break
+
+    with state_lock:
+        replay_finished = True
+    print("Replay finished.")
+
+
+# ----------------------------------------------------------------------
+# Accumulation control (called from the HTTP server thread)
+# ----------------------------------------------------------------------
+
+def start_accumulation():
+    global accumulating, accum_start_time
+    with state_lock:
+        if not accumulating:
+            accumulating = True
+            accum_start_time = time.time()
+
+
+def stop_accumulation():
+    global accumulating, accum_start_time, accum_elapsed
+    with state_lock:
+        if accumulating:
+            accum_elapsed += time.time() - accum_start_time
+            accum_start_time = None
+            accumulating = False
+
+
+def reset_accumulation(channels):
+    global accumulating, accum_start_time, accum_elapsed, accum_count, accum_sum, coinc_count
+    with state_lock:
+        accumulating = False
+        accum_start_time = None
+        accum_elapsed = 0.0
+        accum_count = 0
+        accum_sum = {c: 0 for c in channels}
+        coinc_count = {
+            (t, b): 0 for t in top_channels_global for b in bottom_channels_global
+        }
+
+
+def export_to_file(channels, source_name):
+    with state_lock:
+        elapsed_sec = current_elapsed()
+        m = int(elapsed_sec // 60)
+        s = elapsed_sec % 60
+        elapsed_str = f"{m:02d}:{s:04.1f}"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        lines = [
+            "========================================",
+            "  miniMazinga - Exported Run Statistics ",
+            "========================================",
+            f"Timestamp:      {timestamp}",
+            f"Source CSV:     {source_name}",
+            f"Elapsed Time:   {elapsed_str} ({elapsed_sec:.2f} s)",
+            f"Total Events:   {accum_count}",
+            "----------------------------------------",
+            "Accumulated Sums (Above Threshold):",
+        ]
+        for c in channels:
+            label = f"T{c}" if c in top_channels_global else f"B{c}"
+            lines.append(f"  Channel {c:2d} ({label}): {accum_sum.get(c, 0)}")
+
+        lines.append("----------------------------------------")
+        lines.append("Accumulated Coincidences (Top & Bottom):")
+        for t in top_channels_global:
+            for b in bottom_channels_global:
+                count = coinc_count.get((t, b), 0)
+                lines.append(f"  T{t} & B{b}: {count}")
+        lines.append("========================================\n")
+
+    filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"Exported run statistics to {filename}")
+    return filename
+
+
+def current_elapsed():
+    """Must be called while holding state_lock."""
+    if accumulating and accum_start_time is not None:
+        return accum_elapsed + (time.time() - accum_start_time)
+    return accum_elapsed
+
+
+# ----------------------------------------------------------------------
+# HTTP server
+# ----------------------------------------------------------------------
+
+def build_leds_html(channels):
+    """Separate page: 1x5 top + 1x5 bottom status LEDs (lit when bit is 1)."""
+    top = channels[0:N_TOP]
+    bottom = channels[N_TOP:N_TOP + N_BOTTOM]
+
+    def make_cells(chs, name):
+        return "\n".join(
+            f'''
+        <div class="cell" id="cell-{c}">
+          <h3>{name} {c}</h3>
+          <div class="led" id="led-{c}"></div>
+        </div>'''
+            for c in chs
+        )
+
+    top_cells = make_cells(top, "Top")
+    bottom_cells = make_cells(bottom, "Bottom")
+    channel_list_js = json.dumps(channels)
+    top_channels_js = json.dumps(top)
+    bottom_channels_js = json.dumps(bottom)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>miniMazinga Status LEDs</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background-color: #0f172a;
+    background-image: url('background.jpg');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    color: #f8fafc;
+    margin: 0;
+    padding: 12px;
+  }}
+  h1 {{
+    font-size: 16px;
+    margin: 0 0 4px 4px;
+    color: #f1f5f9;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  }}
+  a {{ color: #38bdf8; font-size: 12px; margin-left: 4px; }}
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat({N_TOP}, 1fr);
+    grid-template-rows: 1fr;
+    gap: 6px;
+    max-width: 800px;
+  }}
+  .wrap {{
+    position: relative;
+    max-width: 800px;
+    margin-top: 8px;
+  }}
+  .spacer {{
+    height: 500px;
+  }}
+  .arrows {{
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: visible;
+  }}
+  .arrows line {{
+    stroke: #475569;
+    stroke-width: 2.5;
+    opacity: 0.6;
+  }}
+  .arrows line.on {{
+    stroke: #ef4444;
+    stroke-width: 2.5;
+    opacity: 1;
+    filter: drop-shadow(0 0 4px rgba(239, 68, 68, 0.9));
+  }}
+  .cell {{
+    background: rgba(30, 41, 59, 0.85);
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    padding: 6px;
+    min-width: 0;
+    text-align: center;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+  }}
+  .cell h3 {{
+    margin: 0 0 2px 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+  }}
+  .led {{
+    width: 24px;
+    height: 24px;
+    margin: 2px auto;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #450a0a, #180202);
+    border: 1.5px solid #0f172a;
+    box-shadow: inset 0 0 4px rgba(0,0,0,0.8);
+    transition: background 0.08s linear, box-shadow 0.08s linear;
+  }}
+  .led.on {{
+    background: radial-gradient(circle at 35% 30%, #fca5a5, #ef4444);
+    border-color: #991b1b;
+    box-shadow: 0 0 10px 2px rgba(239, 68, 68, 0.9), inset 0 0 4px rgba(255,255,255,0.4);
+  }}
+</style>
+</head>
+<body>
+<h1>miniMazinga Status LEDs</h1>
+<a href="/">&larr; Back to main dashboard</a>
+<div class="wrap" id="wrap">
+  <div class="grid">
+{top_cells}
+  </div>
+  <div class="spacer"></div>
+  <div class="grid">
+{bottom_cells}
+  </div>
+  <svg class="arrows" id="arrows" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <marker id="head-off" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+      </marker>
+      <marker id="head-on" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="5" markerHeight="5" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#ef4444"/>
+      </marker>
+    </defs>
+  </svg>
+</div>
+
+<script>
+const channels = {channel_list_js};
+const topChannels = {top_channels_js};
+const bottomChannels = {bottom_channels_js};
+const SVGNS = 'http://www.w3.org/2000/svg';
+const arrowLines = {{}};  // key "t-b" -> <line>
+
+function drawArrows() {{
+  const wrap = document.getElementById('wrap').getBoundingClientRect();
+  const svg = document.getElementById('arrows');
+  svg.querySelectorAll('line').forEach(l => l.remove());
+  const SPREAD = 8;  // px between arrow endpoints on one cell edge
+  const nT = topChannels.length;
+  const nB = bottomChannels.length;
+  topChannels.forEach((t, i) => {{
+    const tr = document.getElementById('cell-' + t).getBoundingClientRect();
+    bottomChannels.forEach((b, j) => {{
+      const br = document.getElementById('cell-' + b).getBoundingClientRect();
+      const x1 = tr.left + tr.width / 2 + (j - (nB - 1) / 2) * SPREAD - wrap.left;
+      const y1 = tr.bottom - wrap.top;
+      const x2 = br.left + br.width / 2 + (i - (nT - 1) / 2) * SPREAD - wrap.left;
+      const y2 = br.top - wrap.top - 2;
+      const line = document.createElementNS(SVGNS, 'line');
+      line.setAttribute('x1', x1);
+      line.setAttribute('y1', y1);
+      line.setAttribute('x2', x2);
+      line.setAttribute('y2', y2);
+      line.setAttribute('marker-end', 'url(#head-off)');
+      svg.appendChild(line);
+      arrowLines[t + '-' + b] = line;
+    }});
+  }});
+}}
+
+function setArrow(line, on) {{
+  if (on) {{
+    if (!line.classList.contains('on')) {{
+      line.classList.add('on');
+      line.setAttribute('marker-end', 'url(#head-on)');
+      line.parentNode.appendChild(line);  // bring lit arrow to front
+    }}
+  }} else if (line.classList.contains('on')) {{
+    line.classList.remove('on');
+    line.setAttribute('marker-end', 'url(#head-off)');
+  }}
+}}
+
+drawArrows();
+window.addEventListener('resize', drawArrows);
+
+async function poll() {{
+  try {{
+    const res = await fetch('/data.json');
+    const data = await res.json();
+    for (const c of channels) {{
+      const entry = data.channels[c];
+      const ledEl = document.getElementById('led-' + c);
+      if (entry && entry.above) {{
+        ledEl.classList.add('on');
+      }} else {{
+        ledEl.classList.remove('on');
+      }}
+    }}
+    for (const t of topChannels) {{
+      for (const b of bottomChannels) {{
+        const topOn = data.channels[t] && data.channels[t].above;
+        const bottomOn = data.channels[b] && data.channels[b].above;
+        setArrow(arrowLines[t + '-' + b], !!(topOn && bottomOn));
+      }}
+    }}
+  }} catch (e) {{
+    console.error(e);
+  }}
+  setTimeout(poll, 200);
+}}
+poll();
+</script>
+</body>
+</html>
+"""
+
+
+def build_html(channels):
+    """5x5 coincidence grid, 2x5 sums. Status LEDs live on /leds."""
+    top_channels = channels[0:N_TOP]
+    bottom_channels = channels[N_TOP:N_TOP + N_BOTTOM]
+
+    coinc_cells = "\n".join(
+        f'''
+        <div class="cell coinc-cell">
+          <h3>T{t} &amp; B{b}</h3>
+          <div class="led led-small" id="coinc-{t}-{b}"></div>
+        </div>'''
+        for t in top_channels
+        for b in bottom_channels
+    )
+
+    distance_between_rows = 15
+    bar_width = 4
+    # Angle corresponding to each pair of bars in coincidence
+    coinc_angles = {}
+    for i, t in enumerate(top_channels):
+        for j, b in enumerate(bottom_channels):
+            dx = (i - j) * bar_width
+            coinc_angles[(t, b)] = math.degrees(math.atan2(dx, distance_between_rows))
+
+    coinc_sum_cells = "\n".join(
+        f'''
+        <div class="cell coinc-cell">
+          <h3>T{t} &amp; B{b}</h3>
+          <div class="value sum" id="coincsum-{t}-{b}">&mdash;</div>
+          <div class="angle">{coinc_angles[(t, b)]:.1f}&deg;</div>
+        </div>'''
+        for t in top_channels
+        for b in bottom_channels
+    )
+
+    sum_cells_top = "\n".join(
+        f'''
+        <div class="cell">
+          <h3>Top {t}</h3>
+          <div class="value sum" id="sum-{t}">&mdash;</div>
+        </div>'''
+        for t in top_channels
+    )
+
+    sum_cells_bottom = "\n".join(
+        f'''
+        <div class="cell">
+          <h3>Bottom {b}</h3>
+          <div class="value sum" id="sum-{b}">&mdash;</div>
+        </div>'''
+        for b in bottom_channels
+    )
+
+    channel_list_js = json.dumps(channels)
+    top_channels_js = json.dumps(top_channels)
+    bottom_channels_js = json.dumps(bottom_channels)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>miniMazinga Viewer</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background-color: #0f172a;
+    background-image: url('background.jpg');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    color: #f8fafc;
+    margin: 0;
+    padding: 12px;
+  }}
+  h1 {{
+    font-size: 16px;
+    margin: 0 0 4px 4px;
+    color: #f1f5f9;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  }}
+  h2 {{
+    font-size: 12px;
+    margin: 12px 0 6px 4px;
+    color: #cbd5e1;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
+  }}
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat({N_TOP}, 1fr);
+    grid-template-rows: repeat(2, 1fr);
+    gap: 6px;
+    max-width: 800px;
+  }}
+  .grid.coinc {{
+    grid-template-rows: repeat({N_TOP}, 1fr);
+  }}
+  .cell {{
+    background: rgba(30, 41, 59, 0.85);
+    backdrop-filter: blur(4px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    padding: 6px;
+    min-width: 0;
+    text-align: center;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+  }}
+  .coinc-cell {{
+    padding: 4px;
+  }}
+  .cell h3 {{
+    margin: 0 0 2px 0;
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+  }}
+  .coinc-cell h3 {{
+    font-size: 10px;
+    margin-bottom: 2px;
+  }}
+  .angle {{
+    font-size: 9px;
+    color: #94a3b8;
+  }}
+  .value {{
+    font-size: 20px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #38bdf8;
+  }}
+  .value.sum {{
+    color: #34d399;
+  }}
+  .led {{
+    width: 24px;
+    height: 24px;
+    margin: 2px auto;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #450a0a, #180202);
+    border: 1.5px solid #0f172a;
+    box-shadow: inset 0 0 4px rgba(0,0,0,0.8);
+    transition: background 0.08s linear, box-shadow 0.08s linear;
+  }}
+  .led.led-small {{
+    width: 16px;
+    height: 16px;
+    margin: 2px auto;
+  }}
+  .led.on {{
+    background: radial-gradient(circle at 35% 30%, #fca5a5, #ef4444);
+    border-color: #991b1b;
+    box-shadow: 0 0 10px 2px rgba(239, 68, 68, 0.9), inset 0 0 4px rgba(255,255,255,0.4);
+  }}
+  .controls {{
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 10px;
+    margin: 12px 0;
+    flex-wrap: wrap;
+    background: rgba(15, 23, 42, 0.75);
+    backdrop-filter: blur(4px);
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    max-width: 800px;
+  }}
+  button {{
+    font-size: 11px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 4px;
+    border: 1px solid #475569;
+    background: #334155;
+    color: #f8fafc;
+    cursor: pointer;
+  }}
+  button:hover {{
+    background: #475569;
+  }}
+  #startBtn {{
+    background: #15803d;
+    color: #ffffff;
+    border-color: #166534;
+  }}
+  #startBtn:hover {{
+    background: #16a34a;
+  }}
+  #stopBtn {{
+    background: #b91c1c;
+    color: #ffffff;
+    border-color: #991b1b;
+  }}
+  #stopBtn:hover {{
+    background: #dc2626;
+  }}
+  #resetBtn {{
+    background: #475569;
+    color: #ffffff;
+    border-color: #334155;
+  }}
+  #resetBtn:hover {{
+    background: #64748b;
+  }}
+  #exportBtn {{
+    background: #1d4ed8;
+    color: #ffffff;
+    border-color: #1e40af;
+  }}
+  #exportBtn:hover {{
+    background: #2563eb;
+  }}
+  .status {{
+    font-size: 11px;
+    color: #cbd5e1;
+    margin-left: 4px;
+  }}
+  .timer {{
+    font-size: 16px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #cbd5e1;
+  }}
+  .running {{
+    color: #4ade80;
+  }}
+</style>
+</head>
+<body>
+<h1>miniMazinga Viewer</h1>
+
+<a href="/leds" target="_blank" style="color:#38bdf8;font-size:12px;margin-left:4px;">Open Status LEDs page &rarr;</a>
+
+<h2>Coincidence: top (T) AND bottom (B)</h2>
+<div class="grid coinc">
+{coinc_cells}
+</div>
+
+<div class="controls">
+  <button id="startBtn" onclick="callControl('/start')">Start accumulation</button>
+  <button id="stopBtn" onclick="callControl('/stop')">Stop accumulation</button>
+  <button id="resetBtn" onclick="callControl('/reset')">Reset accumulation</button>
+  <button id="exportBtn" onclick="callControl('/export')">Export to TXT</button>
+  <span class="status" id="status">stopped</span>
+  <span class="timer" id="timer">00:00.0</span>
+</div>
+
+<h2>Accumulated sum (<span id="countLabel">0</span> events)</h2>
+<div class="grid">
+{sum_cells_top}
+{sum_cells_bottom}
+</div>
+
+<h2>Accumulated coincidences (T &amp; B)</h2>
+<div class="grid coinc">
+{coinc_sum_cells}
+</div>
+
+<script>
+const channels = {channel_list_js};
+const topChannels = {top_channels_js};
+const bottomChannels = {bottom_channels_js};
+
+async function callControl(path) {{
+  try {{
+    const res = await fetch(path, {{ method: 'POST' }});
+    if (path === '/export' && res.ok) {{
+      const data = await res.json();
+      alert('Data exported successfully to:\\n' + data.filename);
+    }}
+  }} catch (e) {{
+    console.error(e);
+  }}
+}}
+
+function formatElapsed(sec) {{
+  const m = Math.floor(sec / 60);
+  const s = (sec % 60).toFixed(1);
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(4, '0');
+}}
+
+async function poll() {{
+  try {{
+    const res = await fetch('/data.json');
+    const data = await res.json();
+
+    for (const c of channels) {{
+      const entry = data.channels[c];
+      const sumEl = document.getElementById('sum-' + c);
+
+      sumEl.textContent = (entry && entry.sum !== null && entry.sum !== undefined)
+        ? entry.sum : '\\u2014';
+    }}
+
+    for (const t of topChannels) {{
+      for (const b of bottomChannels) {{
+        const key = t + '-' + b;
+        const coincEl = document.getElementById('coinc-' + key);
+        const topOn = data.channels[t] && data.channels[t].above;
+        const bottomOn = data.channels[b] && data.channels[b].above;
+        if (topOn && bottomOn) {{
+          coincEl.classList.add('on');
+        }} else {{
+          coincEl.classList.remove('on');
+        }}
+
+        const coincSumEl = document.getElementById('coincsum-' + key);
+        const count = data.coinc_count[key];
+        coincSumEl.textContent = (count !== null && count !== undefined) ? count : '\\u2014';
+      }}
+    }}
+
+    document.getElementById('countLabel').textContent = data.accum_count;
+    document.getElementById('timer').textContent = formatElapsed(data.elapsed);
+
+    const statusEl = document.getElementById('status');
+    const timerEl = document.getElementById('timer');
+    if (data.accumulating) {{
+      statusEl.textContent = 'accumulating...';
+      timerEl.classList.add('running');
+    }} else {{
+      statusEl.textContent = data.replay_finished ? 'stopped (CSV finished)' : 'stopped';
+      timerEl.classList.remove('running');
+    }}
+  }} catch (e) {{
+    console.error(e);
+  }}
+  setTimeout(poll, 200);
+}}
+poll();
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    channels = []      # set by main()
+    source_name = ""   # set by main()
+
+    def log_message(self, fmt, *args):
+        pass  # keep the console quiet
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            body = build_html(self.channels).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/leds":
+            body = build_leds_html(self.channels).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif self.path == "/background.jpg":
+            try:
+                with open("background.jpg", "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+            except FileNotFoundError:
+                self.send_response(404)
+                self.end_headers()
+
+        elif self.path == "/data.json":
+            with state_lock:
+                channels_data = {
+                    str(c): {
+                        "value": latest_values.get(c),
+                        "above": above_threshold.get(c, False),
+                        "sum": accum_sum.get(c),
+                    }
+                    for c in self.channels
+                }
+                coinc = {
+                    f"{t}-{b}": coinc_count.get((t, b), 0)
+                    for t in top_channels_global
+                    for b in bottom_channels_global
+                }
+                payload = {
+                    "channels": channels_data,
+                    "coinc_count": coinc,
+                    "accumulating": accumulating,
+                    "accum_count": accum_count,
+                    "elapsed": current_elapsed(),
+                    "replay_finished": replay_finished,
+                }
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/start":
+            start_accumulation()
+            self._ok()
+        elif self.path == "/stop":
+            stop_accumulation()
+            self._ok()
+        elif self.path == "/reset":
+            reset_accumulation(self.channels)
+            self._ok()
+        elif self.path == "/export":
+            filename = export_to_file(self.channels, self.source_name)
+            body = json.dumps({"ok": True, "filename": filename}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _ok(self):
+        body = b'{"ok": true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def main():
+    global accum_sum, top_channels_global, bottom_channels_global, coinc_count
+
+    parser = argparse.ArgumentParser(
+        description="Live dashboard replaying a CSV of 10-bit masks "
+                    "(first 5 bits top, last 5 bits bottom)."
+    )
+    parser.add_argument("csv", type=str, help="CSV file with one 10-bit mask per line, e.g. 1000010000")
+    parser.add_argument("--rate", type=float, default=10.0,
+                        help="Mean replay rate in events per second; arrival times are Poisson "
+                             "distributed (0 = as fast as possible). Default 10.")
+    parser.add_argument("--loop", action="store_true", help="Restart from the top when the file ends")
+    parser.add_argument("--http-port", type=int, default=8000, help="Local web server port")
+    args = parser.parse_args()
+
+    channels = list(range(N_CHANNELS))  # 0..4 top, 5..9 bottom
+
+    accum_sum = {c: 0 for c in channels}
+    top_channels_global = channels[0:N_TOP]
+    bottom_channels_global = channels[N_TOP:N_TOP + N_BOTTOM]
+    coinc_count = {
+        (t, b): 0 for t in top_channels_global for b in bottom_channels_global
+    }
+
+    Handler.channels = channels
+    Handler.source_name = args.csv
+
+    stop_event = threading.Event()
+    replay_thread = threading.Thread(
+        target=replay_loop, args=(args.csv, channels, args.rate, args.loop, stop_event), daemon=True
+    )
+    replay_thread.start()
+
+    server = ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler)
+    print(f"Dashboard running at http://127.0.0.1:{args.http_port}/")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        stop_event.set()
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()
