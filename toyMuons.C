@@ -4,7 +4,6 @@
 #include <TMath.h>
 #include <TH2F.h>
 #include <TCanvas.h>
-#include <TRandom3.h>
 #include <TLine.h>
 #include <TBox.h>
 #include <TMarker.h>
@@ -14,6 +13,7 @@
 #include <TString.h>
 #include <TTree.h>
 #include <TFile.h>
+#include "EcoMug.h"
 
 // Bar index hit by coordinate x, or -1 if x falls in a gap or outside the layer.
 static int barIndex(double x, int nBars, double barW, double gap)
@@ -32,27 +32,34 @@ static int barIndex(double x, int nBars, double barW, double gap)
 void toyMuons()
 {
     // geometry & simulation parameters (cm, s)
-    const double I0 = 1.0;            // muon flux [muons / (cm^2 * s)]
     const double exposure_s = 3600.0;    // exposure time [s]
-    const int    nBars = 4;           // bars per layer
+    const int    nBars = 5;           // bars per layer
     const double barW = 4.0;          // bar width along X [cm]
     const double gap = 0.0;           // gap between neighbouring bars [cm]
     const double Ly = 20.0;           // bar length along Y [cm]
     const double h = 15.0;            // distance top layer -> bottom layer [cm]
     const int    nPrint = 20;         // print first N coincidence events
     const int    nDraw = 100;         // draw first N coincidence tracks
+    const int    seed = 0;            // EcoMug seed (0 = random)
 
     const double Lx = nBars * barW + (nBars - 1) * gap;  // layer width [cm]
-    const double A = Lx * Ly;                            // generation area [cm^2]
-    const int num_muons = static_cast<int>(I0 * A * exposure_s);
 
-    TRandom3 randGen(0);
+    // EcoMug sky plane = top layer plane (z = h), same size as the layer.
+    // Sizes go in as value * EMUnits::cm, positions come out in EMUnits and are divided back.
+    EcoMug gen;
+    gen.SetUseSky();
+    gen.SetSkySize({{Lx * EMUnits::cm, Ly * EMUnits::cm}});
+    gen.SetSkyCenterPosition({{0., 0., h * EMUnits::cm}});
+    gen.SetSeed(seed);
+
+    // muons in the exposure, from the EcoMug rate (129 Hz/m^2 horizontal by default)
+    const int num_muons = static_cast<int>(exposure_s / gen.GetEstimatedTime(1));
 
     // output tree: one entry per muon crossing the top layer plane
     int topMask = 0, botMask = 0;   // bit i set = bar i fired
     int topBar = -1, botBar = -1;
     bool coinc = false;
-    double x0, y0, xb, yb, th, ph;
+    double x0, y0, xb, yb, th, ph, p, charge;
     TTree *tree = new TTree("events", "toy MC bar hits");
     tree->Branch("x0", &x0);
     tree->Branch("y0", &y0);
@@ -60,6 +67,8 @@ void toyMuons()
     tree->Branch("yb", &yb);
     tree->Branch("theta", &th);
     tree->Branch("phi", &ph);
+    tree->Branch("p", &p);           // [GeV/c]
+    tree->Branch("charge", &charge);
     tree->Branch("topMask", &topMask);
     tree->Branch("botMask", &botMask);
     tree->Branch("topBar", &topBar);
@@ -87,18 +96,19 @@ void toyMuons()
 
     for (int i = 0; i < num_muons; ++i)
     {
-        // direction: cos^2 zenith distribution (same as the template)
-        double u = randGen.Uniform(0.0, 1.0);
-        th = TMath::ACos(TMath::Sqrt(u));
-        ph = randGen.Uniform(0.0, 2.0 * TMath::Pi());
-
-        // entrance point on the top layer plane (z = h)
-        x0 = randGen.Uniform(-Lx / 2.0, Lx / 2.0);
-        y0 = randGen.Uniform(-Ly / 2.0, Ly / 2.0);
+        // direction, momentum, charge and entrance point on the top layer plane (z = h)
+        gen.Generate();
+        const auto pos = gen.GetGenerationPosition();
+        x0 = pos[0] / EMUnits::cm;
+        y0 = pos[1] / EMUnits::cm;
+        th = gen.GetGenerationTheta();
+        ph = gen.GetGenerationPhi();
+        p = gen.GetGenerationMomentum();
+        charge = gen.GetCharge();
 
         // point on the bottom layer plane (z = 0)
-        xb = x0 + h * TMath::Tan(th) * TMath::Cos(ph);
-        yb = y0 + h * TMath::Tan(th) * TMath::Sin(ph);
+        xb = x0 - h * TMath::Tan(th) * TMath::Cos(ph);
+        yb = y0 - h * TMath::Tan(th) * TMath::Sin(ph);
 
         // bar hits
         topBar = barIndex(x0, nBars, barW, gap);
